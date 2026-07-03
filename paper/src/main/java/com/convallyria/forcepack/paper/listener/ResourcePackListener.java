@@ -30,7 +30,6 @@ import org.bukkit.event.player.PlayerResourcePackStatusEvent;
 
 import java.lang.reflect.Constructor;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
