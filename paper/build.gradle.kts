@@ -55,7 +55,7 @@ dependencies {
     }
     implementation("net.kyori:adventure-text-minimessage:4.25.0")
     implementation("org.bstats:bstats-bukkit:3.0.2")
-    implementation("com.github.retrooper:packetevents-spigot:2.13.1+8187e23-SNAPSHOT")
+    implementation("com.github.retrooper:packetevents-spigot:2.13.1+4d40422-SNAPSHOT")
 }
 
 tasks {
