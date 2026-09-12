@@ -1,6 +1,7 @@
 package com.convallyria.forcepack.velocity;
 
 import com.convallyria.forcepack.api.ForcePackPlatform;
+import com.convallyria.forcepack.api.managed.ManagedResourcePackService;
 import com.convallyria.forcepack.api.resourcepack.PackFormatResolver;
 import com.convallyria.forcepack.api.resourcepack.ResourcePack;
 import com.convallyria.forcepack.api.resourcepack.ResourcePackVersion;
@@ -13,6 +14,7 @@ import com.convallyria.forcepack.velocity.command.Commands;
 import com.convallyria.forcepack.velocity.config.VelocityConfig;
 import com.convallyria.forcepack.velocity.handler.PackHandler;
 import com.convallyria.forcepack.velocity.listener.ResourcePackListener;
+import com.convallyria.forcepack.velocity.managed.VelocityManagedService;
 import com.convallyria.forcepack.velocity.resourcepack.VelocityResourcePack;
 import com.convallyria.forcepack.velocity.schedule.VelocityScheduler;
 import com.convallyria.forcepack.webserver.ForcePackWebServer;
@@ -103,6 +105,7 @@ public class ForcePackVelocity implements ForcePackPlatform {
 
     private VelocityConfig config;
     private PackHandler packHandler;
+    private VelocityManagedService managedService;
     private final Set<ResourcePack> globalResourcePacks = new HashSet<>();
     private final Set<ResourcePack> resourcePacks = new HashSet<>();
 
@@ -130,8 +133,10 @@ public class ForcePackVelocity implements ForcePackPlatform {
             }
         }
 
+        this.managedService = new VelocityManagedService(this);
         this.packHandler = new PackHandler(this);
         this.loadResourcePacks(null);
+        this.managedService.start();
         this.registerListeners();
         metricsFactory.make(this, 13678);
     }
@@ -183,7 +188,11 @@ public class ForcePackVelocity implements ForcePackPlatform {
         resourcePacks.clear();
         globalResourcePacks.clear();
 
+        // Only the static registry is cleared. Managed URLs are content-indexed and must survive
+        // a reload, because a player may be downloading from one right now.
         getWebServer().ifPresent(ForcePackWebServer::clearHostedPacks);
+
+        if (managedService != null) managedService.reloadProfiles();
 
         this.checkUnload();
         this.checkGlobal();
@@ -586,6 +595,11 @@ public class ForcePackVelocity implements ForcePackPlatform {
 
     public PackHandler getPackHandler() {
         return packHandler;
+    }
+
+    @Override
+    public Optional<ManagedResourcePackService> getManagedService() {
+        return Optional.ofNullable(managedService);
     }
 
     private MiniMessage miniMessage;

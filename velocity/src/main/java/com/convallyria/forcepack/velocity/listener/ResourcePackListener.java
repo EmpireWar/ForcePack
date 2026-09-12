@@ -1,6 +1,7 @@
 package com.convallyria.forcepack.velocity.listener;
 
 import com.convallyria.forcepack.api.check.SpoofCheck;
+import com.convallyria.forcepack.api.managed.ManagedPackStatus;
 import com.convallyria.forcepack.api.permission.Permissions;
 import com.convallyria.forcepack.api.player.ForcePackPlayer;
 import com.convallyria.forcepack.api.resourcepack.ResourcePack;
@@ -8,6 +9,8 @@ import com.convallyria.forcepack.api.utils.GeyserUtil;
 import com.convallyria.forcepack.velocity.ForcePackVelocity;
 import com.convallyria.forcepack.velocity.config.VelocityConfig;
 import com.convallyria.forcepack.velocity.handler.PackHandler;
+import com.convallyria.forcepack.velocity.managed.PackStateTracker;
+import com.convallyria.forcepack.velocity.managed.VelocityManagedService;
 import com.convallyria.forcepack.velocity.resourcepack.VelocityResourcePack;
 import com.velocitypowered.api.command.CommandSource;
 import com.velocitypowered.api.event.EventTask;
@@ -57,6 +60,18 @@ public class ResourcePackListener {
 
         if ((packInfo != null && packInfo.getOrigin() != ResourcePackInfo.Origin.PLUGIN_ON_PROXY) || !plugin.getPackHandler().isWaitingFor(player, id)) {
             plugin.log("Resource pack with URL %s and ID %s was sent from a downstream server! This is unsupported behaviour.", packInfo == null ? "(unknown: legacy)" : packInfo.getUrl(), id);
+            return;
+        }
+
+        // A managed offer carries its own descriptor and policy. Read the tracked request instead
+        // of searching this server's configured packs for something that looks similar: during a
+        // switch the configured packs are no longer the ones this reply is about.
+        final VelocityManagedService managed = (VelocityManagedService) plugin.getManagedService().orElse(null);
+        final PackStateTracker.Request request = managed == null
+                ? null
+                : managed.getTracker().request(player.getUniqueId(), id).orElse(null);
+        if (request != null) {
+            handleManagedStatus(player, currentServer, managed, request, status);
             return;
         }
 
@@ -129,6 +144,48 @@ public class ResourcePackListener {
             player.disconnect(component);
         } else {
             player.sendMessage(component);
+        }
+    }
+
+    private void handleManagedStatus(Player player,
+                                     ServerConnection currentServer,
+                                     VelocityManagedService managed,
+                                     PackStateTracker.Request request,
+                                     PlayerResourcePackStatusEvent.Status status) {
+        final ManagedPackStatus managedStatus = toManagedStatus(status);
+        plugin.log("%s sent managed status %s for slot %s", player.getUsername(),
+                managedStatus.name(), request.entry().logicalKey());
+
+        final VelocityConfig profileConfig = managed
+                .profileConfigFor(currentServer.getServerInfo().getName()).orElse(null);
+        if (profileConfig != null && tryValidateHacks(player, status, profileConfig)) return;
+
+        managed.getTracker().onStatus(player.getUniqueId(), request.entry().packId(), managedStatus);
+
+        // Progress, not an outcome.
+        if (managedStatus == ManagedPackStatus.ACCEPTED || managedStatus == ManagedPackStatus.DOWNLOADED) return;
+
+        // Enforcement belongs to the request's own failure policy, applied when the operation
+        // completes. Only the backend notification happens here.
+        plugin.getPackHandler().processWaitingResourcePack(player, request.entry().packId());
+        final boolean waiting = plugin.getPackHandler().isWaiting(player);
+        final String name = status == PlayerResourcePackStatusEvent.Status.SUCCESSFUL
+                ? "SUCCESSFULLY_LOADED"
+                : status.name();
+        currentServer.sendPluginMessage(PackHandler.FORCEPACK_STATUS_IDENTIFIER,
+                (request.entry().packId() + ";" + name + ";" + !waiting).getBytes(StandardCharsets.UTF_8));
+        plugin.log("Sent player '%s' plugin message downstream to '%s' for status '%s'", player.getUsername(),
+                currentServer.getServerInfo().getName(), name);
+    }
+
+    private static ManagedPackStatus toManagedStatus(PlayerResourcePackStatusEvent.Status status) {
+        if (status == PlayerResourcePackStatusEvent.Status.SUCCESSFUL) {
+            return ManagedPackStatus.SUCCESSFULLY_LOADED;
+        }
+        try {
+            return ManagedPackStatus.valueOf(status.name());
+        } catch (IllegalArgumentException unknown) {
+            return ManagedPackStatus.UNKNOWN;
         }
     }
 
