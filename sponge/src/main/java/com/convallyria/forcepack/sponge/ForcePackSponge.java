@@ -6,6 +6,7 @@ import com.convallyria.forcepack.api.player.ForcePackPlayer;
 import com.convallyria.forcepack.api.resourcepack.ResourcePack;
 import com.convallyria.forcepack.api.resourcepack.ResourcePackVersion;
 import com.convallyria.forcepack.api.schedule.PlatformScheduler;
+import com.convallyria.forcepack.api.state.PackStateMessage;
 import com.convallyria.forcepack.api.utils.ClientVersion;
 import com.convallyria.forcepack.api.utils.GeyserUtil;
 import com.convallyria.forcepack.api.utils.HashingUtil;
@@ -18,6 +19,7 @@ import com.convallyria.forcepack.sponge.listener.ResourcePackListener;
 import com.convallyria.forcepack.sponge.player.ForcePackSpongePlayer;
 import com.convallyria.forcepack.sponge.resourcepack.SpongeResourcePack;
 import com.convallyria.forcepack.sponge.schedule.SpongeScheduler;
+import com.convallyria.forcepack.sponge.state.SpongePackStateService;
 import com.convallyria.forcepack.sponge.util.FileSystemUtils;
 import com.convallyria.forcepack.sponge.util.ProtocolUtil;
 import com.convallyria.forcepack.webserver.ForcePackWebServer;
@@ -46,6 +48,7 @@ import org.spongepowered.api.event.lifecycle.RegisterChannelEvent;
 import org.spongepowered.api.event.lifecycle.RegisterCommandEvent;
 import org.spongepowered.api.event.lifecycle.StartingEngineEvent;
 import org.spongepowered.api.network.ServerConnectionState;
+import org.spongepowered.api.network.ServerSideConnection;
 import org.spongepowered.api.network.channel.ChannelBuf;
 import org.spongepowered.api.network.channel.raw.RawDataChannel;
 import org.spongepowered.api.profile.GameProfile;
@@ -60,6 +63,7 @@ import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
 import java.lang.invoke.MethodHandles;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -75,6 +79,7 @@ import java.util.Properties;
 import java.util.ResourceBundle;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
@@ -102,6 +107,9 @@ public class ForcePackSponge implements ForcePackPlatform {
         this.logger = logger;
         this.configDir = configDir;
         this.scheduler = new SpongeScheduler(this);
+        this.packStateService = new SpongePackStateService(this::sendOnProxyConnection,
+                player -> Sponge.isServerAvailable() && Sponge.server().player(player).isPresent(),
+                this::log);
         this.loadConfig();
         metrics.make(13677);
     }
@@ -179,6 +187,52 @@ public class ForcePackSponge implements ForcePackPlatform {
     }
 
     private final Map<UUID, ForcePackSpongePlayer> waiting = new HashMap<>();
+
+    // The connection record. Unlike the waiting map above it lasts until disconnect, so processing
+    // a terminal status no longer throws away everything we know about the player and drops every
+    // message that follows.
+    private final Map<UUID, ServerSideConnection> connections = new ConcurrentHashMap<>();
+    private final SpongePackStateService packStateService;
+    private @Nullable RawDataChannel stateChannel;
+
+    /**
+     * @return the proxy-authoritative pack state a backend plugin should consume
+     */
+    public SpongePackStateService getPackStateService() {
+        return packStateService;
+    }
+
+    /**
+     * Starts, or refreshes, the connection record for a player.
+     *
+     * @param player the player
+     * @param connection their connection
+     */
+    public void trackConnection(UUID player, ServerSideConnection connection) {
+        connections.put(player, connection);
+    }
+
+    public Optional<ServerSideConnection> getConnection(UUID player) {
+        return Optional.ofNullable(connections.get(player));
+    }
+
+    /**
+     * Ends the connection record. State never crosses connections.
+     *
+     * @param player the player
+     */
+    public void forgetConnection(UUID player) {
+        connections.remove(player);
+        packStateService.forget(player);
+    }
+
+    private boolean sendOnProxyConnection(UUID player, byte[] payload) {
+        final RawDataChannel channel = this.stateChannel;
+        final ServerSideConnection connection = connections.get(player);
+        if (channel == null || connection == null) return false;
+        channel.play().sendTo(connection, buf -> buf.writeBytes(payload));
+        return true;
+    }
 
     public void processWaitingResourcePack(UUID player, UUID packId) {
         // If the player is on a version older than 1.20.3, they can only have one resource pack.
@@ -366,34 +420,70 @@ public class ForcePackSponge implements ForcePackPlatform {
 
     @Listener
     public void onRegisterChannels(RegisterChannelEvent event) {
+        // This event fires once at startup, so a channel that is not registered here can never be
+        // registered later. The state channel is therefore registered whatever the mode is.
+        final RawDataChannel state = event.register(
+                ResourceKey.of(PackStateMessage.CHANNEL_NAMESPACE, PackStateMessage.CHANNEL_NAME),
+                RawDataChannel.class);
+        this.stateChannel = state;
+        state.play().addHandler(ServerConnectionState.Game.class, (message, connectionState) -> {
+            handleStateMessage(connectionState.profile(), connectionState.connection(), message);
+        });
+        state.play().addHandler(ServerConnectionState.Configuration.class, (message, connectionState) -> {
+            handleStateMessage(connectionState.profile(), connectionState.connection(), message);
+        });
+
         if (!getConfig().node("velocity-mode").getBoolean()) return;
         getLogger().info("Enabled velocity listener");
 
         final RawDataChannel channel = event.register(ResourceKey.of("forcepack", "status"), RawDataChannel.class);
-        channel.play().addHandler(ServerConnectionState.Game.class, (message, state) -> {
-            handlePackStatusMessage(state.profile(), message);
+        channel.play().addHandler(ServerConnectionState.Game.class, (message, connectionState) -> {
+            handlePackStatusMessage(connectionState.profile(), connectionState.connection(), message);
         });
 
-        channel.play().addHandler(ServerConnectionState.Configuration.class, (message, state) -> {
-            handlePackStatusMessage(state.profile(), message);
+        channel.play().addHandler(ServerConnectionState.Configuration.class, (message, connectionState) -> {
+            handlePackStatusMessage(connectionState.profile(), connectionState.connection(), message);
         });
     }
 
-    private void handlePackStatusMessage(GameProfile profile, ChannelBuf message) {
-        final ForcePackSpongePlayer player = getForcePackPlayer(profile.uniqueId()).orElse(null);
-        if (player == null) {
+    private void handleStateMessage(GameProfile profile, ServerSideConnection connection, ChannelBuf message) {
+        final UUID player = profile.uniqueId();
+        if (connections.replace(player, connection) == null) {
+            // Not a tracked connection: an exempt player, or one we never saw authenticate.
+            return;
+        }
+        packStateService.handlePayload(player, message.readBytes(message.available()));
+    }
+
+    private void handlePackStatusMessage(GameProfile profile, ServerSideConnection connection, ChannelBuf message) {
+        final UUID uuid = profile.uniqueId();
+        if (!connections.containsKey(uuid)) {
             // Player isn't valid - wasn't added at auth
             return;
         }
 
-        final String data = new String(message.readBytes(message.available()));
+        // The proxy encodes UTF-8. Decoding with the platform default charset gives a different
+        // answer on a differently configured server.
+        final String data = new String(message.readBytes(message.available()), StandardCharsets.UTF_8);
         final String[] split = data.split(";");
-        log("Posted event");
+        if (split.length < 3) {
+            getLogger().warn("Discarded a malformed resource pack status message: '{}'", data);
+            return;
+        }
 
-        final ResourcePackStatus status = ResourcePackStatus.valueOf(split[1]);
-        final UUID packId = UUID.fromString(split[0]);
+        final UUID packId;
+        final ResourcePackStatus status;
+        try {
+            packId = UUID.fromString(split[0]);
+            status = ResourcePackStatus.valueOf(split[1]);
+        } catch (IllegalArgumentException malformed) {
+            getLogger().warn("Discarded a resource pack status message we cannot read: '{}'", data);
+            return;
+        }
         final boolean proxyRemove = Boolean.parseBoolean(split[2]);
-        Sponge.eventManager().post(new MultiVersionResourcePackStatusEvent(profile, player.getConnection(), packId, status, true, proxyRemove));
+
+        log("Posted event");
+        Sponge.eventManager().post(new MultiVersionResourcePackStatusEvent(profile, connection, packId, status, true, proxyRemove));
     }
 
     private void registerListeners() {
