@@ -14,6 +14,7 @@ import com.convallyria.forcepack.velocity.command.Commands;
 import com.convallyria.forcepack.velocity.config.VelocityConfig;
 import com.convallyria.forcepack.velocity.handler.PackHandler;
 import com.convallyria.forcepack.velocity.listener.ResourcePackListener;
+import com.convallyria.forcepack.velocity.managed.PackStateChannel;
 import com.convallyria.forcepack.velocity.managed.VelocityManagedService;
 import com.convallyria.forcepack.velocity.resourcepack.VelocityResourcePack;
 import com.convallyria.forcepack.velocity.schedule.VelocityScheduler;
@@ -138,6 +139,9 @@ public class ForcePackVelocity implements ForcePackPlatform {
         this.loadResourcePacks(null);
         this.managedService.start();
         this.registerListeners();
+        // Backends have to be able to ask for state, so the channel is registered whether or not
+        // any profile is managed.
+        new PackStateChannel(this, this.managedService).register();
         metricsFactory.make(this, 13678);
     }
 
