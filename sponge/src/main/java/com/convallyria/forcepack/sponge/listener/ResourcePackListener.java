@@ -53,8 +53,11 @@ public class ResourcePackListener {
         final GameProfile player = event.getProfile();
 
         final ForcePackSpongePlayer forcePackPlayer = plugin.getForcePackPlayer(player.uniqueId()).orElse(null);
-        if (forcePackPlayer == null) {
-            // Player isn't valid - wasn't added at auth
+        final boolean tracked = plugin.getConnection(player.uniqueId()).isPresent();
+        if (forcePackPlayer == null && !(event.isProxy() && tracked)) {
+            // Player isn't valid - wasn't added at auth.
+            // A proxy status only needs the connection record: the waiting set is emptied by the
+            // first pack that finishes, and every later status for that session would be lost.
             return;
         }
 
@@ -260,6 +263,7 @@ public class ResourcePackListener {
         if (ForcePackSpongePlayer.profileIsValid(plugin, profile)) {
             final ForcePackSpongePlayer player = plugin.addToWaiting(profile.uniqueId(), Set.of());
             player.setConnection(event.connection());
+            plugin.trackConnection(profile.uniqueId(), event.connection());
         }
     }
 
@@ -274,6 +278,7 @@ public class ResourcePackListener {
 
         // Track connection so we can close it during config phase
         player.setConnection(event.connection());
+        plugin.trackConnection(profile.uniqueId(), event.connection());
     }
 
     @Listener
@@ -287,6 +292,12 @@ public class ResourcePackListener {
         }
 
         forcePackPlayer.setConnection(event.connection());
+        plugin.trackConnection(player.uniqueId(), event.connection());
+
+        // State buffered during the configuration phase can be acted on now, and a transfer that
+        // reused a cached pack produces no status of its own, so ask for the authoritative one.
+        plugin.getPackStateService().markReady(player.uniqueId());
+        plugin.getPackStateService().requestSnapshot(player.uniqueId());
 
         final boolean velocityMode = getConfig().node("velocity-mode").getBoolean();
         if (velocityMode) {
@@ -360,6 +371,7 @@ public class ResourcePackListener {
     public void onQuit(ServerSideConnectionEvent.Disconnect event) {
         event.profile().ifPresent(profile -> {
             plugin.removeFromWaiting(profile.uniqueId());
+            plugin.forgetConnection(profile.uniqueId());
             sentAccept.remove(profile.uniqueId());
         });
     }
