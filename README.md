@@ -59,6 +59,24 @@ Available to download on:
 - Per-server support on Velocity
 - Live reloading with resource pack updating
 - Easy to use custom force resource pack message for 1.17+ clients
+- Managed per-player selection on Velocity, with immutable content-indexed hosting
+- Versioned pack state for backends over the `forcepack:state` channel
+
+## For developers
+
+`ForcePackAPI#getManagedService()` returns a `ManagedResourcePackService` on Velocity. A plugin
+prepares an artifact once with `prepare`, registers a `PackSelectionProvider` under an owner name,
+and binds a server or group profile to that name with `selection-provider`. ForcePack keeps the
+offer, the enforcement, the correlation of replies, and the reporting of state. A profile without
+`selection-provider` behaves exactly as it always has.
+
+Velocity publishes that state to backends on the `forcepack:state` plugin channel. On Sponge,
+`ForcePackSponge#getPackStateService()` gives the `BackendPackStateService` view of it: the last
+snapshot for a player, a subscription for changes, and a request for the authoritative state when a
+player becomes usable. The `forcepack:status` relay is unchanged.
+
+Depend on `com.convallyria.forcepack:api` with `compileOnly`. Do not shade a second copy of those
+classes.
 
 ## Getting Started
 
