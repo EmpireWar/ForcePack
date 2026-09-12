@@ -3,6 +3,10 @@ plugins {
     `maven-publish`
 }
 
+// Consumers depend on the api with compileOnly rather than shading a second copy of these
+// classes, so the publication needs real coordinates.
+group = "com.convallyria.forcepack"
+
 repositories {
     maven("https://repo.opencollab.dev/main/")
 }
