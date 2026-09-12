@@ -6,6 +6,7 @@ import com.convallyria.forcepack.api.player.ForcePackPlayer;
 import com.convallyria.forcepack.api.resourcepack.ResourcePack;
 import com.convallyria.forcepack.api.resourcepack.ResourcePackVersion;
 import com.convallyria.forcepack.api.schedule.PlatformScheduler;
+import com.convallyria.forcepack.api.state.BackendPackStateService;
 import com.convallyria.forcepack.api.state.PackStateMessage;
 import com.convallyria.forcepack.api.utils.ClientVersion;
 import com.convallyria.forcepack.api.utils.GeyserUtil;
@@ -200,6 +201,11 @@ public class ForcePackSponge implements ForcePackPlatform {
      */
     public SpongePackStateService getPackStateService() {
         return packStateService;
+    }
+
+    @Override
+    public Optional<BackendPackStateService> getBackendStateService() {
+        return Optional.of(packStateService);
     }
 
     /**
