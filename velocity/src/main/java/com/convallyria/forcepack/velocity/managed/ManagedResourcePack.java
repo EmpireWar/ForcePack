@@ -9,6 +9,7 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 
 import java.util.Objects;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 /**
  * One managed offer: a prepared pack plus the identity and policy of the request it belongs to.
@@ -24,13 +25,15 @@ public final class ManagedResourcePack extends ResourcePack {
     private final UUID offerId;
     private final @Nullable String prompt;
     private final boolean required;
+    private final Consumer<Runnable> guard;
 
     public ManagedResourcePack(final ForcePackVelocity plugin,
                                final String server,
                                final PreparedPack prepared,
                                final UUID offerId,
                                final @Nullable String prompt,
-                               final boolean required) {
+                               final boolean required,
+                               final Consumer<Runnable> guard) {
         super(plugin, server, prepared.url(), prepared.sha1(), toMegabytes(prepared.sizeBytes()),
                 prepared.version().orElse(null));
         this.plugin = plugin;
@@ -38,6 +41,7 @@ public final class ManagedResourcePack extends ResourcePack {
         this.offerId = Objects.requireNonNull(offerId, "offerId");
         this.prompt = prompt;
         this.required = required;
+        this.guard = Objects.requireNonNull(guard, "guard");
     }
 
     private static int toMegabytes(long sizeBytes) {
@@ -57,9 +61,9 @@ public final class ManagedResourcePack extends ResourcePack {
     public void setResourcePack(UUID player) {
         final int delay = plugin.getConfig().getInt("delay-pack-sending-by");
         if (delay > 0) {
-            plugin.getScheduler().executeDelayed(() -> send(player), delay);
+            plugin.getScheduler().executeDelayed(() -> guard.accept(() -> send(player)), delay);
         } else {
-            send(player);
+            guard.accept(() -> send(player));
         }
     }
 

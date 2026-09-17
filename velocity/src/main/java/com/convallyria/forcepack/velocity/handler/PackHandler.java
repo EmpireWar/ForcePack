@@ -58,6 +58,12 @@ public final class PackHandler {
     }
 
     public EventTask handleConfigurationPhase(final Player player, final ServerConnection server) {
+        synchronized (player) {
+            return handleConfigurationPhaseLocked(player, server);
+        }
+    }
+
+    private EventTask handleConfigurationPhaseLocked(final Player player, final ServerConnection server) {
         final UUID uuid = player.getUniqueId();
         configurationPhaseHandled.add(uuid);
 
@@ -82,6 +88,7 @@ public final class PackHandler {
     }
 
     public boolean takeConfigurationPhaseHandled(final Player player) {
+        configurationPhaseServers.remove(player.getUniqueId());
         return configurationPhaseHandled.remove(player.getUniqueId());
     }
 
@@ -90,7 +97,7 @@ public final class PackHandler {
     }
 
     private void completeConfigurationPhase(final UUID uuid) {
-        configurationPhaseServers.remove(uuid);
+        // Keep the target valid until post-connect: completion callbacks can still finish here.
         final CompletableFuture<Void> future = configurationPhaseCompletions.remove(uuid);
         if (future != null) {
             future.complete(null);
@@ -163,6 +170,12 @@ public final class PackHandler {
     }
 
     public void setPack(final Player player, final ServerConnection server) {
+        synchronized (player) {
+            setPackLocked(player, server);
+        }
+    }
+
+    private void setPackLocked(final Player player, final ServerConnection server) {
         // The player connected to a new server
         // Therefore, any pending resource pack sends from the last server should be cancelled
         final Set<PendingResourcePackSend> pending = pendingTasks.remove(player.getUniqueId());

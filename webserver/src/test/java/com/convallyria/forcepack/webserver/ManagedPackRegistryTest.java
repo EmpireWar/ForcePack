@@ -138,4 +138,53 @@ class ManagedPackRegistryTest {
 
         assertEquals(0, registry.collect(Collections.emptySet(), 30_000L), "a download in progress is recent use");
     }
+
+    @Test
+    void repairsSameSizeCorruptionAfterRestart(@TempDir Path directory) throws Exception {
+        final Path source = write(directory, "pack.zip", "pack one");
+        final String hash = sha1Of(source);
+        final ManagedPackRegistry.Entry entry = registry(directory).register(source, hash, 8L);
+        Files.writeString(entry.file(), "bad data");
+
+        final ManagedPackRegistry restarted = registry(directory);
+        restarted.register(source, hash, 8L);
+        assertArrayEquals(Files.readAllBytes(source), Files.readAllBytes(restarted.lookup(hash).orElseThrow().file()));
+    }
+
+    @Test
+    void rejectsSourceMutationDuringCopy(@TempDir Path directory) throws Exception {
+        final Path source = write(directory, "pack.zip", "pack one");
+        final String hash = sha1Of(source);
+        final ManagedPackRegistry registry = new ManagedPackRegistry(directory.resolve("store"), now::get,
+                (from, to) -> {
+                    Files.writeString(from, "bad data");
+                    Files.copy(from, to, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                });
+
+        assertThrows(IOException.class, () -> registry.register(source, hash, 8L));
+        assertTrue(registry.lookup(hash).isEmpty());
+        try (java.util.stream.Stream<Path> files = Files.list(directory.resolve("store"))) {
+            assertEquals(0L, files.count(), "no partial artifact remains published or on disk");
+        }
+    }
+
+    @Test
+    void concurrentRegistrationsAndReadsSeeCompleteBytes(@TempDir Path directory) throws Exception {
+        final Path source = write(directory, "pack.zip", "pack one");
+        final String hash = sha1Of(source);
+        final byte[] expected = Files.readAllBytes(source);
+        final ManagedPackRegistry registry = registry(directory);
+        final java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(4);
+        try {
+            final java.util.List<java.util.concurrent.Callable<Void>> requests = new java.util.ArrayList<>();
+            for (int i = 0; i < 40; i++) requests.add(() -> {
+                registry.register(source, hash, expected.length);
+                assertArrayEquals(expected, Files.readAllBytes(registry.lookup(hash).orElseThrow().file()));
+                return null;
+            });
+            for (java.util.concurrent.Future<Void> request : pool.invokeAll(requests)) request.get();
+        } finally {
+            pool.shutdownNow();
+        }
+    }
 }

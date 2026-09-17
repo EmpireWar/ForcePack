@@ -33,7 +33,7 @@ repositories {
     maven("https://s01.oss.sonatype.org/content/repositories/snapshots/")
 }
 
-project.version = "1.3.75-SNAPSHOT"
+project.version = "1.4.0-managed.1-SNAPSHOT"
 
 java {
     toolchain.languageVersion.set(JavaLanguageVersion.of(21))

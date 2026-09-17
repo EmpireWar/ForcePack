@@ -84,8 +84,8 @@ public final class PackStateChannel {
     }
 
     private boolean isCurrentBackend(Player player, ServerConnection connection) {
-        final ServerConnection current = player.getCurrentServer()
-                .or(() -> plugin.getPackHandler().getConfigurationPhaseServer(player))
+        final ServerConnection current = plugin.getPackHandler().getConfigurationPhaseServer(player)
+                .or(player::getCurrentServer)
                 .orElse(null);
         return current != null && current.getServerInfo().equals(connection.getServerInfo());
     }
@@ -95,13 +95,15 @@ public final class PackStateChannel {
     }
 
     private void sendSnapshot(Player player, @Nullable ServerConnection target) {
-        final ServerConnection connection = target != null ? target : player.getCurrentServer()
-                .or(() -> plugin.getPackHandler().getConfigurationPhaseServer(player))
+        final ServerConnection connection = target != null ? target : plugin.getPackHandler().getConfigurationPhaseServer(player)
+                .or(player::getCurrentServer)
                 .orElse(null);
         if (connection == null) return;
 
         final PackStateSnapshot snapshot = service.getTracker().wireSnapshot(player.getUniqueId()).orElse(null);
         if (snapshot == null) return;
+        if (service.profileFor(connection.getServerInfo().getName()).isEmpty()
+                || !snapshot.serverName().orElse("").equals(connection.getServerInfo().getName())) return;
 
         // Always on the player's own connection.
         connection.sendPluginMessage(IDENTIFIER, PackStateCodec.encode(PackStateMessage.snapshot(snapshot)));
