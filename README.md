@@ -75,8 +75,24 @@ Velocity publishes that state to backends on the `forcepack:state` plugin channe
 snapshot for a player, a subscription for changes, and a request for the authoritative state when a
 player becomes usable. The `forcepack:status` relay is unchanged.
 
-Depend on `com.convallyria.forcepack:api` with `compileOnly`. Do not shade a second copy of those
-classes.
+Depend on `com.convallyria.forcepack:api:1.4.0-managed.1-SNAPSHOT` with `compileOnly`.
+This extension has distinct coordinates from the pre-extension `1.3.75-SNAPSHOT` API.
+Deploy matching managed builds on Velocity and Sponge. Do not shade a second copy of those classes.
+
+Providers must expose configured defaults and reusable selections through `retainedPacks()`.
+These artifacts stay hosted until the provider releases them or unregisters; unreferenced
+development artifacts can expire normally. An unavailable or failing provider refuses admission
+to its managed profiles with a diagnostic. Static profiles remain independent.
+
+Backend consumers must explicitly opt into managed delivery and confirm a player's state through
+an authoritative snapshot. Service availability alone does not establish that the proxy uses a
+managed profile. Keep native status handling for static proxy profiles and standalone Sponge.
+
+Managed offers and recovery are scoped to the player connection, destination and generation.
+Superseding a request or attempting a backend transfer cancels old work without triggering recovery;
+a client failure can restore the previous successful selection only on the same backend connection.
+Hosted files are hash-checked before reuse and after copying. Publication requires atomic file
+replacement; filesystems that cannot provide it reject registration rather than serving partial ZIPs.
 
 ## Getting Started
 

@@ -1,6 +1,7 @@
 package com.convallyria.forcepack.api.managed;
 
 import java.util.Collections;
+import java.util.Collection;
 import java.util.Set;
 
 /**
@@ -36,6 +37,17 @@ public interface PackSelectionProvider {
      */
     default Set<String> ownedKeys() {
         return Collections.emptySet();
+    }
+
+    /**
+     * Prepared selections this provider may return even while no players are connected.
+     * Hosting retains these packs until they disappear from this collection or the provider
+     * unregisters. Return a thread-safe snapshot; this is called during garbage collection.
+     *
+     * @return configured defaults and other reusable selections
+     */
+    default Collection<PreparedPack> retainedPacks() {
+        return Collections.emptyList();
     }
 
     /**

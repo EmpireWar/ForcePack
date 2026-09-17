@@ -44,6 +44,21 @@ class PackStateTrackerTest {
     }
 
     @Test
+    void replacementCallbackSeesCommittedNewSelection() {
+        final UUID nextOffer = UUID.randomUUID();
+        final CompletableFuture<ApplyResult> old = select(tracker.beginGeneration(player, "siege"),
+                Collections.singletonList(pending(SLOT, UUID.randomUUID(), SHA_A)));
+        final CompletableFuture<Boolean> observed = old.thenApply(result ->
+                result.terminalStatus() == ManagedPackStatus.CANCELLED
+                        && tracker.snapshot(player).desired().get(0).packId().equals(nextOffer));
+        final CompletableFuture<ApplyResult> next = select(tracker.beginGeneration(player, "siege"),
+                Collections.singletonList(pending(SLOT, nextOffer, SHA_B)));
+        assertTrue(observed.join(), "callbacks must run after the entire replacement mutation");
+        assertTrue(tracker.onStatus(player, nextOffer, ManagedPackStatus.SUCCESSFULLY_LOADED));
+        assertTrue(next.join().success());
+    }
+
+    @Test
     void progressStatusesDoNotCompleteTheOperation() {
         final UUID offer = UUID.randomUUID();
         final long generation = tracker.beginGeneration(player, "v3-lobby");

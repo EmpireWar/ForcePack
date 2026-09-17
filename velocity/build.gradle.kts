@@ -12,6 +12,9 @@ repositories {
 }
 
 dependencies {
+    testImplementation("org.mockito:mockito-core:5.11.0")
+    testImplementation("com.velocitypowered:velocity-api:3.4.0-SNAPSHOT")
+    testImplementation("com.electronwill.night-config:toml:3.8.0")
     implementation(project(":api"))
     implementation(project(":webserver", "shadow"))
 

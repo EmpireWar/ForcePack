@@ -206,57 +206,61 @@ public final class PackStateTracker {
         final Session session = session(player);
         final List<UUID> superseded = new ArrayList<>();
         PlayerPackState published = null;
+        Runnable cancelled = () -> { };
+        Runnable completed;
         synchronized (session) {
             if (generation != session.generation) {
                 // A newer transition already started. Do not send anything for this one.
-                completion.complete(ApplyResult.failure(state(session), ManagedPackStatus.CANCELLED,
-                        "selection for generation " + generation + " was superseded", false));
-                return superseded;
-            }
+                final ApplyResult result = ApplyResult.failure(state(session), ManagedPackStatus.CANCELLED,
+                        "selection for generation " + generation + " was superseded", false);
+                completed = () -> completion.complete(result);
+            } else {
+                cancelled = drainPending(session, ManagedPackStatus.CANCELLED, "superseded by a newer selection");
 
-            drainPending(session, ManagedPackStatus.CANCELLED, "superseded by a newer selection");
+                final Set<UUID> keptIds = new LinkedHashSet<>();
+                for (PackEntryState entry : desired) {
+                    keptIds.add(entry.packId());
+                }
 
-            final Set<UUID> keptIds = new LinkedHashSet<>();
-            for (PackEntryState entry : desired) {
-                keptIds.add(entry.packId());
-            }
+                session.removed.clear();
+                for (PackEntryState previous : session.desired.values()) {
+                    if (!keptIds.contains(previous.packId())) {
+                        superseded.add(previous.packId());
+                    }
+                }
+                for (PackEntryState previous : session.applied.values()) {
+                    if (!keptIds.contains(previous.packId()) && !superseded.contains(previous.packId())) {
+                        superseded.add(previous.packId());
+                    }
+                }
+                for (PackEntryState previous : session.applied.values()) {
+                    if (!keptIds.contains(previous.packId())) {
+                        session.removed.put(previous.logicalKey(), previous.withStatus(ManagedPackStatus.REMOVED));
+                    }
+                }
+                session.applied.values().removeIf(entry -> !keptIds.contains(entry.packId()));
+                session.desired.clear();
+                for (PackEntryState entry : desired) {
+                    session.desired.put(entry.logicalKey(), entry);
+                    session.offerGenerations.put(entry.packId(), generation);
+                    if (entry.status().isApplied()) {
+                        session.applied.put(entry.logicalKey(), entry);
+                    }
+                }
 
-            session.removed.clear();
-            for (PackEntryState previous : session.desired.values()) {
-                if (!keptIds.contains(previous.packId())) {
-                    superseded.add(previous.packId());
-                }
+                session.required = required;
+                session.failurePolicy = failurePolicy;
+                session.completion = completion;
+                session.operationGeneration = generation;
+                session.deadlineMillis = clockMillis.getAsLong() + Math.max(0L, timeoutMillis);
+                session.sequence++;
+                published = state(session);
+                completed = checkCompletion(session);
             }
-            for (PackEntryState previous : session.applied.values()) {
-                if (!keptIds.contains(previous.packId()) && !superseded.contains(previous.packId())) {
-                    superseded.add(previous.packId());
-                }
-            }
-            for (PackEntryState previous : session.applied.values()) {
-                if (!keptIds.contains(previous.packId())) {
-                    session.removed.put(previous.logicalKey(), previous.withStatus(ManagedPackStatus.REMOVED));
-                }
-            }
-            session.applied.values().removeIf(entry -> !keptIds.contains(entry.packId()));
-            session.desired.clear();
-            for (PackEntryState entry : desired) {
-                session.desired.put(entry.logicalKey(), entry);
-                session.offerGenerations.put(entry.packId(), generation);
-                if (entry.status().isApplied()) {
-                    session.applied.put(entry.logicalKey(), entry);
-                }
-            }
-
-            session.required = required;
-            session.failurePolicy = failurePolicy;
-            session.completion = completion;
-            session.operationGeneration = generation;
-            session.deadlineMillis = clockMillis.getAsLong() + Math.max(0L, timeoutMillis);
-            session.sequence++;
-            published = state(session);
-            checkCompletion(session);
         }
         publish(published);
+        cancelled.run();
+        completed.run();
         return superseded;
     }
 
@@ -307,6 +311,7 @@ public final class PackStateTracker {
         final Session session = sessions.get(player);
         if (session == null) return false;
         PlayerPackState published = null;
+        final Runnable completed;
         synchronized (session) {
             final PackEntryState entry = lookup(session, packId);
             if (entry == null) return false;
@@ -314,6 +319,7 @@ public final class PackStateTracker {
             if (offerGeneration == null || offerGeneration != session.generation) return false;
             if (entry.status() == status) return true;
             if (entry.status().isTerminal() && status == ManagedPackStatus.SENT) return true;
+            if (entry.status().isTerminal() && !entry.status().isApplied()) return false;
 
             final PackEntryState updated = entry.withStatus(status);
             session.desired.put(updated.logicalKey(), updated);
@@ -327,9 +333,10 @@ public final class PackStateTracker {
             }
             session.sequence++;
             published = state(session);
-            checkCompletion(session);
+            completed = checkCompletion(session);
         }
         publish(published);
+        completed.run();
         return true;
     }
 
@@ -343,8 +350,9 @@ public final class PackStateTracker {
         final Session session = sessions.get(player);
         if (session == null) return;
         PlayerPackState published = null;
+        final Runnable completed;
         synchronized (session) {
-            if (session.completion == null) return;
+            session.generation++;
             for (Map.Entry<String, PackEntryState> entry : session.desired.entrySet()) {
                 if (!entry.getValue().status().isTerminal()) {
                     entry.setValue(entry.getValue().withStatus(ManagedPackStatus.CANCELLED));
@@ -352,9 +360,10 @@ public final class PackStateTracker {
             }
             session.sequence++;
             published = state(session);
-            drainPending(session, ManagedPackStatus.CANCELLED, reason);
+            completed = drainPending(session, ManagedPackStatus.CANCELLED, reason);
         }
         publish(published);
+        completed.run();
     }
 
     /**
@@ -366,6 +375,7 @@ public final class PackStateTracker {
         final long now = clockMillis.getAsLong();
         final List<UUID> expired = new ArrayList<>();
         final List<PlayerPackState> published = new ArrayList<>();
+        final List<Runnable> completions = new ArrayList<>();
         for (Session session : sessions.values()) {
             synchronized (session) {
                 if (session.completion == null || session.deadlineMillis > now) continue;
@@ -377,13 +387,14 @@ public final class PackStateTracker {
                 session.applied.values().removeIf(entry -> !entry.status().isApplied());
                 session.sequence++;
                 published.add(state(session));
-                drainPending(session, ManagedPackStatus.TIMED_OUT, "the client did not reply in time");
+                completions.add(drainPending(session, ManagedPackStatus.TIMED_OUT, "the client did not reply in time"));
                 expired.add(session.player);
             }
         }
         for (PlayerPackState state : published) {
             publish(state);
         }
+        completions.forEach(Runnable::run);
         return expired;
     }
 
@@ -395,9 +406,11 @@ public final class PackStateTracker {
     public void onDisconnect(UUID player) {
         final Session session = sessions.remove(player);
         if (session == null) return;
+        final Runnable completed;
         synchronized (session) {
-            drainPending(session, ManagedPackStatus.CANCELLED, "the player disconnected");
+            completed = drainPending(session, ManagedPackStatus.CANCELLED, "the player disconnected");
         }
+        completed.run();
     }
 
     /**
@@ -483,10 +496,10 @@ public final class PackStateTracker {
         return null;
     }
 
-    private void checkCompletion(Session session) {
-        if (session.completion == null) return;
+    private Runnable checkCompletion(Session session) {
+        if (session.completion == null) return () -> { };
         for (PackEntryState entry : session.desired.values()) {
-            if (!entry.status().isTerminal()) return;
+            if (!entry.status().isTerminal()) return () -> { };
         }
 
         final PlayerPackState state = state(session);
@@ -495,8 +508,7 @@ public final class PackStateTracker {
         if (state.aggregate() == PackApplicationState.APPLIED
                 || state.aggregate() == PackApplicationState.NONE
                 || state.aggregate() == PackApplicationState.REMOVED) {
-            completion.complete(ApplyResult.success(state));
-            return;
+            return () -> completion.complete(ApplyResult.success(state));
         }
         ManagedPackStatus worst = ManagedPackStatus.UNKNOWN;
         String reason = "the selection was not applied";
@@ -507,14 +519,16 @@ public final class PackStateTracker {
                 break;
             }
         }
-        completion.complete(ApplyResult.failure(state, worst, reason, false));
+        final ApplyResult result = ApplyResult.failure(state, worst, reason, false);
+        return () -> completion.complete(result);
     }
 
-    private void drainPending(Session session, ManagedPackStatus status, String reason) {
+    private Runnable drainPending(Session session, ManagedPackStatus status, String reason) {
         final CompletableFuture<ApplyResult> completion = session.completion;
-        if (completion == null) return;
+        if (completion == null) return () -> { };
         session.completion = null;
-        completion.complete(ApplyResult.failure(state(session), status, reason, false));
+        final ApplyResult result = ApplyResult.failure(state(session), status, reason, false);
+        return () -> completion.complete(result);
     }
 
     private static PlayerPackState state(Session session) {

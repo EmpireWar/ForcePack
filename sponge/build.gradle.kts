@@ -68,6 +68,9 @@ configurations {
 val adventureApiNbt by configurations.creating
 
 dependencies {
+    testImplementation("org.mockito:mockito-core:5.11.0")
+    testImplementation("org.spongepowered:spongeapi:18.0.0-SNAPSHOT")
+    testImplementation("io.netty:netty-all:4.1.105.Final")
     implementation(project(":api"))
     implementation(project(":webserver", "shadow"))
     implementation("com.github.retrooper:packetevents-sponge:2.13.1+4d40422-SNAPSHOT")

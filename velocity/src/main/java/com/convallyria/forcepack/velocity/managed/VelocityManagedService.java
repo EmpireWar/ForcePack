@@ -18,6 +18,7 @@ import com.convallyria.forcepack.velocity.ForcePackVelocity;
 import com.convallyria.forcepack.velocity.config.VelocityConfig;
 import com.convallyria.forcepack.velocity.handler.PackHandler;
 import com.convallyria.forcepack.webserver.ForcePackWebServer;
+import com.convallyria.forcepack.webserver.ManagedPackRegistry;
 import com.velocitypowered.api.network.ProtocolVersion;
 import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ServerConnection;
@@ -109,12 +110,64 @@ public final class VelocityManagedService implements ManagedResourcePackService 
     private final PackStateTracker tracker;
     private final List<ProviderEntry> providers = new CopyOnWriteArrayList<>();
     private final Map<String, ManagedProfile> profiles = new ConcurrentHashMap<>();
-    private final Map<String, PreparedPack> prepared = new ConcurrentHashMap<>();
-    private final Map<UUID, PackSelection> lastSuccessful = new ConcurrentHashMap<>();
+    private final Map<UUID, SuccessfulSelection> lastSuccessful = new ConcurrentHashMap<>();
+    private final Map<UUID, Operation> operations = new ConcurrentHashMap<>();
+
+    private static final class SuccessfulSelection {
+        private final ServerConnection server;
+        private final PackSelection selection;
+
+        private SuccessfulSelection(ServerConnection server, PackSelection selection) {
+            this.server = server;
+            this.selection = selection;
+        }
+    }
+
+    private static final class Operation {
+        private final Player player;
+        private final ServerConnection server;
+        private final long generation;
+
+        private Operation(Player player, ServerConnection server, long generation) {
+            this.player = player;
+            this.server = server;
+            this.generation = generation;
+        }
+    }
+
+    private boolean isCurrent(Operation operation) {
+        final Player player = operation.player;
+        final ServerConnection current = plugin.getPackHandler().getConfigurationPhaseServer(player)
+                .or(player::getCurrentServer).orElse(null);
+        return operations.get(player.getUniqueId()) == operation
+                && plugin.getServer().getPlayer(player.getUniqueId()).orElse(null) == player
+                && tracker.generation(player.getUniqueId()) == operation.generation
+                && current == operation.server;
+    }
+
+    /** Invalidates work at the start of every backend attempt, even if the transfer later fails. */
+    public void onBackendTransition(Player player) {
+        synchronized (player) {
+            operations.remove(player.getUniqueId());
+            final PlayerPackState previous = tracker.snapshot(player.getUniqueId());
+            tracker.cancel(player.getUniqueId(), "backend transition");
+            releaseHolds(player.getUniqueId(), previous);
+        }
+    }
+
+    /** True only for a reply to the current operation on this exact connection and backend. */
+    public boolean acceptsStatus(Player player, long generation) {
+        final Operation operation = operations.get(player.getUniqueId());
+        return operation != null && operation.generation == generation && isCurrent(operation);
+    }
 
     public VelocityManagedService(final ForcePackVelocity plugin) {
+        this(plugin, System::currentTimeMillis);
+    }
+
+    VelocityManagedService(final ForcePackVelocity plugin, java.util.function.LongSupplier clock) {
         this.plugin = plugin;
-        this.tracker = new PackStateTracker(System::currentTimeMillis);
+        this.tracker = new PackStateTracker(clock);
     }
 
     public PackStateTracker getTracker() {
@@ -251,24 +304,32 @@ public final class VelocityManagedService implements ManagedResourcePackService 
      * @return true if this backend is managed, so the static path must not also run
      */
     public boolean handleManagedServer(Player player, ServerConnection server) {
-        final String serverName = server.getServerInfo().getName();
-        final ManagedProfile profile = profiles.get(serverName);
-        if (profile == null) return false;
-        apply(player, server, profile);
-        return true;
+        synchronized (player) {
+            final String serverName = server.getServerInfo().getName();
+            final ManagedProfile profile = profiles.get(serverName);
+            if (profile == null) {
+                onBackendTransition(player);
+                lastSuccessful.remove(player.getUniqueId());
+                return false;
+            }
+            apply(player, server, profile);
+            return true;
+        }
     }
 
     private CompletionStage<ApplyResult> apply(Player player, ServerConnection server, ManagedProfile profile) {
         final UUID id = player.getUniqueId();
         final String serverName = server.getServerInfo().getName();
+        lastSuccessful.computeIfPresent(id, (ignored, previous) -> previous.server == server ? previous : null);
         final List<ProviderEntry> matching = providersFor(profile);
         if (matching.isEmpty()) {
-            // Admission with an unrelated static pack would look like success to a backend.
-            // Leave the state unknown and say why.
             plugin.getLogger().error("Server '{}' is bound to selection provider '{}', which is not registered. "
-                            + "No resource pack will be offered to {} until that plugin registers it.",
+                            + "Refusing admission for {}; check that the provider plugin started successfully.",
                     serverName, profile.providerOwner, player.getUsername());
+            operations.remove(id);
             tracker.cancel(id, "selection provider '" + profile.providerOwner + "' is not registered");
+            player.disconnect(Component.text("Resource pack provider '" + profile.providerOwner
+                    + "' is unavailable for " + serverName + ". Please contact an administrator."));
             return CompletableFuture.completedFuture(ApplyResult.failure(tracker.snapshot(id),
                     ManagedPackStatus.UNKNOWN, "selection provider '" + profile.providerOwner
                             + "' is not registered", false));
@@ -276,7 +337,7 @@ public final class VelocityManagedService implements ManagedResourcePackService 
 
         final long generation = tracker.beginGeneration(id, serverName);
         final int protocol = player.getProtocolVersion().getProtocol();
-        final boolean configurationPhase = player.getCurrentServer().isEmpty();
+        final boolean configurationPhase = plugin.getPackHandler().getConfigurationPhaseServer(player).isPresent();
         final PackContext context = new PackContext(id, serverName, protocol,
                 PackFormatResolver.getPackFormat(protocol), generation, configurationPhase);
 
@@ -285,14 +346,25 @@ public final class VelocityManagedService implements ManagedResourcePackService 
         for (ProviderEntry entry : matching) {
             try {
                 final PackSelection produced = entry.provider.select(context, selection);
-                if (produced != null) selection = produced;
+                selection = Objects.requireNonNull(produced, "provider returned no selection");
             } catch (RuntimeException failed) {
-                plugin.getLogger().error("Selection provider '{}' failed for {}; keeping the previous selection.",
+                plugin.getLogger().error("Selection provider '{}' failed for {}; refusing admission.",
                         entry.owner, player.getUsername(), failed);
+                return refuseSelection(player, "selection provider '" + entry.owner + "' failed");
             }
         }
 
+        if (profile.required && selection.isEmpty()) return refuseSelection(player, "the managed provider has no prepared selection");
+
         return offer(player, server, profile, selection, generation);
+    }
+
+    private CompletionStage<ApplyResult> refuseSelection(Player player, String reason) {
+        operations.remove(player.getUniqueId());
+        tracker.cancel(player.getUniqueId(), reason);
+        player.disconnect(Component.text("Resource pack unavailable: " + reason + ". Please contact an administrator."));
+        return CompletableFuture.completedFuture(ApplyResult.failure(tracker.snapshot(player.getUniqueId()),
+                ManagedPackStatus.UNKNOWN, reason, false));
     }
 
     private CompletionStage<ApplyResult> offer(Player player,
@@ -304,6 +376,8 @@ public final class VelocityManagedService implements ManagedResourcePackService 
         final int protocol = player.getProtocolVersion().getProtocol();
         final boolean modern = protocol >= ProtocolVersion.MINECRAFT_1_20_3.getProtocol();
         final String prompt = selection.prompt().orElse(configuredPrompt(profile));
+        final Operation operation = new Operation(player, server, generation);
+        operations.put(id, operation);
 
         final List<PackEntryState> desired = new ArrayList<>();
         final List<ManagedResourcePack> toSend = new ArrayList<>();
@@ -320,13 +394,19 @@ public final class VelocityManagedService implements ManagedResourcePackService 
             final UUID offerId = tracker.allocateOfferId(id, pack.packId());
             desired.add(new PackEntryState(pack.logicalKey(), offerId, pack.sha1(), ManagedPackStatus.PENDING));
             toSend.add(new ManagedResourcePack(plugin, server.getServerInfo().getName(), pack,
-                    offerId, prompt, selection.required()));
+                    offerId, prompt, selection.required(), send -> {
+                        synchronized (player) {
+                            if (isCurrent(operation) && tracker.request(id, offerId)
+                                    .filter(request -> !request.entry().status().isTerminal()).isPresent()) send.run();
+                        }
+                    }));
         }
 
         final CompletableFuture<ApplyResult> completion = new CompletableFuture<>();
         // Registered before anything is sent, so a reply can never arrive before we track it.
         final List<UUID> superseded = tracker.setDesired(id, generation, desired, selection.required(),
                 selection.failurePolicy(), clientTimeoutMillis(), completion);
+        if (!isCurrent(operation)) return completion;
 
         if (modern) {
             for (UUID old : superseded) {
@@ -339,6 +419,7 @@ public final class VelocityManagedService implements ManagedResourcePackService 
             plugin.getPackHandler().runSetPackTask(player, pack, protocol);
             tracker.markSent(id, pack.getUUID());
         }
+        for (UUID old : superseded) plugin.getPackHandler().processWaitingResourcePack(player, old);
 
         for (UUID reusedId : reused) {
             // The static path tells the backend about a pack it did not have to re-send. Do the
@@ -348,16 +429,24 @@ public final class VelocityManagedService implements ManagedResourcePackService 
                             .getBytes(StandardCharsets.UTF_8));
         }
 
-        return completion.thenCompose(result -> finish(player.getUniqueId(), profile, selection, result));
+        return completion.thenCompose(result -> {
+            synchronized (player) {
+                return finish(operation, profile, selection, result);
+            }
+        });
     }
 
-    private CompletionStage<ApplyResult> finish(UUID id,
+    private CompletionStage<ApplyResult> finish(Operation operation,
                                                 ManagedProfile profile,
                                                 PackSelection selection,
                                                 ApplyResult result) {
-        releaseHolds(id);
+        final UUID id = operation.player.getUniqueId();
+        if (result.terminalStatus() == ManagedPackStatus.CANCELLED || !isCurrent(operation)) {
+            return CompletableFuture.completedFuture(result);
+        }
+        releaseHolds(id, result.state());
         if (result.success()) {
-            if (!selection.isEmpty()) lastSuccessful.put(id, selection);
+            if (!selection.isEmpty()) lastSuccessful.put(id, new SuccessfulSelection(operation.server, selection));
             return CompletableFuture.completedFuture(result);
         }
 
@@ -369,7 +458,7 @@ public final class VelocityManagedService implements ManagedResourcePackService 
                 message(id, profile, result.terminalStatus(), true);
                 return CompletableFuture.completedFuture(result);
             case RESTORE_PREVIOUS:
-                return restore(id, profile, selection, result);
+                return restore(operation, profile, selection, result);
             case NOTIFY:
             default:
                 message(id, profile, result.terminalStatus(), false);
@@ -377,15 +466,17 @@ public final class VelocityManagedService implements ManagedResourcePackService 
         }
     }
 
-    private CompletionStage<ApplyResult> restore(UUID id,
+    private CompletionStage<ApplyResult> restore(Operation operation,
                                                  ManagedProfile profile,
                                                  PackSelection failed,
                                                  ApplyResult result) {
-        final PackSelection previous = lastSuccessful.get(id);
-        final Player player = plugin.getServer().getPlayer(id).orElse(null);
-        final ServerConnection server = player == null ? null : player.getCurrentServer()
-                .or(() -> plugin.getPackHandler().getConfigurationPhaseServer(player)).orElse(null);
-        if (previous == null || player == null || server == null || sameContent(previous, failed)) {
+        final UUID id = operation.player.getUniqueId();
+        if (!isCurrent(operation)) return CompletableFuture.completedFuture(result);
+        final SuccessfulSelection successful = lastSuccessful.get(id);
+        final PackSelection previous = successful == null || successful.server != operation.server ? null : successful.selection;
+        final Player player = operation.player;
+        final ServerConnection server = operation.server;
+        if (previous == null || sameContent(previous, failed)) {
             message(id, profile, result.terminalStatus(), false);
             return CompletableFuture.completedFuture(result);
         }
@@ -408,10 +499,10 @@ public final class VelocityManagedService implements ManagedResourcePackService 
         return true;
     }
 
-    private void releaseHolds(UUID id) {
+    private void releaseHolds(UUID id, PlayerPackState state) {
         final Player player = plugin.getServer().getPlayer(id).orElse(null);
         if (player == null) return;
-        for (PackEntryState entry : tracker.snapshot(id).desired()) {
+        for (PackEntryState entry : state.desired()) {
             plugin.getPackHandler().processWaitingResourcePack(player, entry.packId());
         }
     }
@@ -477,8 +568,13 @@ public final class VelocityManagedService implements ManagedResourcePackService 
      * @param id the player
      */
     public void onDisconnect(UUID id) {
-        tracker.onDisconnect(id);
-        lastSuccessful.remove(id);
+        final Operation operation = operations.get(id);
+        final Object lock = operation == null ? this : operation.player;
+        synchronized (lock) {
+            operations.remove(id);
+            tracker.onDisconnect(id);
+            lastSuccessful.remove(id);
+        }
     }
 
     // ------------------------------------------------------------------ api
@@ -486,10 +582,8 @@ public final class VelocityManagedService implements ManagedResourcePackService 
     @Override
     public CompletionStage<PreparedPack> prepare(PackSource source) {
         Objects.requireNonNull(source, "source");
-        final PreparedPack cached = prepared.get(source.sha1());
-        if (cached != null && cached.logicalKey().equals(source.logicalKey())) {
-            return CompletableFuture.completedFuture(cached);
-        }
+        // Re-register even cached content: this verifies hosting and renews its grace period
+        // before the caller can publish it as a newly retained default.
 
         final CompletableFuture<PreparedPack> future = new CompletableFuture<>();
         plugin.getScheduler().executeAsync(() -> {
@@ -516,7 +610,6 @@ public final class VelocityManagedService implements ManagedResourcePackService 
         }
 
         final PreparedPack pack = new PreparedManagedPack(source, url);
-        prepared.put(source.sha1(), pack);
         plugin.log("Prepared managed pack %s", pack);
         return pack;
     }
@@ -558,20 +651,22 @@ public final class VelocityManagedService implements ManagedResourcePackService 
                     ManagedPackStatus.CANCELLED, "the player is not connected", false));
         }
 
-        final ServerConnection server = online.getCurrentServer()
-                .or(() -> plugin.getPackHandler().getConfigurationPhaseServer(online)).orElse(null);
-        if (server == null) {
-            return CompletableFuture.completedFuture(ApplyResult.failure(tracker.snapshot(player),
-                    ManagedPackStatus.CANCELLED, "the player is not on a backend", false));
-        }
+        synchronized (online) {
+            final ServerConnection server = plugin.getPackHandler().getConfigurationPhaseServer(online)
+                    .or(online::getCurrentServer).orElse(null);
+            if (server == null) {
+                return CompletableFuture.completedFuture(ApplyResult.failure(tracker.snapshot(player),
+                        ManagedPackStatus.CANCELLED, "the player is not on a backend", false));
+            }
 
-        final ManagedProfile profile = profiles.get(server.getServerInfo().getName());
-        if (profile == null) {
-            return CompletableFuture.completedFuture(ApplyResult.failure(tracker.snapshot(player),
-                    ManagedPackStatus.UNKNOWN, "'" + server.getServerInfo().getName()
-                            + "' is not a managed profile", false));
+            final ManagedProfile profile = profiles.get(server.getServerInfo().getName());
+            if (profile == null) {
+                return CompletableFuture.completedFuture(ApplyResult.failure(tracker.snapshot(player),
+                        ManagedPackStatus.UNKNOWN, "'" + server.getServerInfo().getName()
+                                + "' is not a managed profile", false));
+            }
+            return apply(online, server, profile);
         }
-        return apply(online, server, profile);
     }
 
     @Override
@@ -589,22 +684,31 @@ public final class VelocityManagedService implements ManagedResourcePackService 
     private void collectHostedContent() {
         final ForcePackWebServer webServer = plugin.getWebServer().orElse(null);
         if (webServer == null) return;
+        collectHostedContent(webServer.getManagedPacks());
+    }
 
+    void collectHostedContent(ManagedPackRegistry registry) {
         final Set<String> retain = new HashSet<>();
+        for (ProviderEntry entry : providers) {
+            try {
+                for (PreparedPack pack : entry.provider.retainedPacks()) retain.add(pack.sha1());
+            } catch (RuntimeException failed) {
+                plugin.getLogger().error("Cannot read retained packs from '{}'; skipping collection.", entry.owner, failed);
+                return;
+            }
+        }
         for (UUID player : tracker.players()) {
             retain.addAll(tracker.retainedContent(player));
         }
-        for (PackSelection selection : lastSuccessful.values()) {
-            for (PreparedPack pack : selection.packs()) {
+        for (SuccessfulSelection successful : lastSuccessful.values()) {
+            for (PreparedPack pack : successful.selection.packs()) {
                 retain.add(pack.sha1());
             }
         }
 
-        final int removed = webServer.getManagedPacks().collect(retain, retentionMillis());
+        final int removed = registry.collect(retain, retentionMillis());
         if (removed > 0) {
             plugin.log("Collected %d managed resource pack(s) nothing was using.", removed);
-            final Set<String> hosted = webServer.getManagedPacks().hosted();
-            prepared.values().removeIf(pack -> pack.source().file().isPresent() && !hosted.contains(pack.sha1()));
         }
     }
 

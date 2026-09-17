@@ -286,13 +286,12 @@ public class ResourcePackListener {
         final ServerPlayer player = event.player();
 
         final ForcePackSpongePlayer forcePackPlayer = plugin.getForcePackPlayer(player.uniqueId()).orElse(null);
-        if (forcePackPlayer == null) {
-            // Player isn't valid - wasn't added at auth
+        if (plugin.getConnection(player.uniqueId()).filter(event.connection()::equals).isEmpty()) {
+            // Authentication owns connection validity; a completed download has no waiting entry.
             return;
         }
 
-        forcePackPlayer.setConnection(event.connection());
-        plugin.trackConnection(player.uniqueId(), event.connection());
+        if (forcePackPlayer != null) forcePackPlayer.setConnection(event.connection());
 
         // State buffered during the configuration phase can be acted on now, and a transfer that
         // reused a cached pack produces no status of its own, so ask for the authoritative one.

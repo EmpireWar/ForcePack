@@ -26,9 +26,9 @@ import java.util.function.LongSupplier;
  * still pointing at.</p>
  *
  * <p>Immutability needs both a fixed path and fixed bytes, so registering copies the
- * source into a store file named after its own SHA-1. Once written, that file is never
- * overwritten: different content produces a different name. Rewriting the caller's source
- * file afterwards therefore cannot change what a client downloads.</p>
+ * source into a store file named after its own SHA-1. Verified content is reused; corrupted
+ * content is repaired through atomic replacement. Different content produces a different
+ * name. Rewriting the caller's source cannot change what a client downloads.</p>
  *
  * <p>Uses nothing outside the JDK on purpose, so it can be exercised without a web server.</p>
  */
@@ -80,15 +80,26 @@ public final class ManagedPackRegistry {
 
     private final Path storeDirectory;
     private final LongSupplier clock;
+    private final FileCopier copier;
     private final Map<String, Entry> entries = new ConcurrentHashMap<>();
+
+    @FunctionalInterface
+    interface FileCopier {
+        void copy(Path source, Path target) throws IOException;
+    }
 
     public ManagedPackRegistry(Path storeDirectory) {
         this(storeDirectory, System::currentTimeMillis);
     }
 
     public ManagedPackRegistry(Path storeDirectory, LongSupplier clock) {
+        this(storeDirectory, clock, (source, target) -> Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING));
+    }
+
+    ManagedPackRegistry(Path storeDirectory, LongSupplier clock, FileCopier copier) {
         this.storeDirectory = Objects.requireNonNull(storeDirectory, "storeDirectory");
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.copier = Objects.requireNonNull(copier, "copier");
     }
 
     /**
@@ -105,16 +116,17 @@ public final class ManagedPackRegistry {
      * @return the hosted entry
      * @throws IOException if the source cannot be read, or its bytes do not match
      */
-    public Entry register(Path source, String sha1, long sizeBytes) throws IOException {
+    public synchronized Entry register(Path source, String sha1, long sizeBytes) throws IOException {
         Objects.requireNonNull(source, "source");
         final String id = normalise(sha1);
         final long now = clock.getAsLong();
 
         final Entry existing = entries.get(id);
-        if (existing != null && Files.isRegularFile(existing.file)) {
+        if (existing != null && matches(existing.file, id, sizeBytes)) {
             existing.lastUsedMillis = now;
             return existing;
         }
+        if (existing != null) entries.remove(id, existing);
 
         final long actualSize = Files.size(source);
         if (actualSize != sizeBytes) {
@@ -127,16 +139,17 @@ public final class ManagedPackRegistry {
 
         Files.createDirectories(storeDirectory);
         final Path stored = storeDirectory.resolve(id + SUFFIX);
-        if (!Files.isRegularFile(stored) || Files.size(stored) != sizeBytes) {
+        if (!matches(stored, id, sizeBytes)) {
+            entries.remove(id);
             // Publish by rename so a download can never observe a half-written file.
             final Path temporary = Files.createTempFile(storeDirectory, id, ".part");
             try {
-                Files.copy(source, temporary, StandardCopyOption.REPLACE_EXISTING);
-                try {
-                    Files.move(temporary, stored, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-                } catch (IOException atomicUnsupported) {
-                    Files.move(temporary, stored, StandardCopyOption.REPLACE_EXISTING);
+                copier.copy(source, temporary);
+                if (!matches(temporary, id, sizeBytes)) {
+                    throw new IOException("Source changed while copying " + source + "; refusing to publish " + id);
                 }
+                // Fail closed on filesystems without atomic replacement. Never expose a partial ZIP.
+                Files.move(temporary, stored, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
             } finally {
                 Files.deleteIfExists(temporary);
             }
@@ -157,7 +170,7 @@ public final class ManagedPackRegistry {
      * @param id either {@code <sha1>.zip} as it appears in the URL, or the bare SHA-1
      * @return the entry, or empty if nothing is hosted under that identity
      */
-    public Optional<Entry> lookup(String id) {
+    public synchronized Optional<Entry> lookup(String id) {
         if (id == null) return Optional.empty();
         String key = id.toLowerCase(Locale.ROOT);
         if (key.endsWith(SUFFIX)) {
@@ -184,7 +197,7 @@ public final class ManagedPackRegistry {
      * @param retentionMillis how long an unreferenced artifact stays after its last use
      * @return the number of artifacts removed
      */
-    public int collect(Set<String> retain, long retentionMillis) {
+    public synchronized int collect(Set<String> retain, long retentionMillis) {
         final Set<String> keep = new HashSet<>();
         for (String id : retain) {
             if (id != null) keep.add(id.toLowerCase(Locale.ROOT));
@@ -226,6 +239,10 @@ public final class ManagedPackRegistry {
             }
         }
         return lower;
+    }
+
+    private static boolean matches(Path file, String sha1, long sizeBytes) throws IOException {
+        return Files.isRegularFile(file) && Files.size(file) == sizeBytes && hash(file).equals(sha1);
     }
 
     private static String hash(Path file) throws IOException {
