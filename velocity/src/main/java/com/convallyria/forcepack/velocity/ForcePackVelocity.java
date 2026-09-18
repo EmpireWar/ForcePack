@@ -228,6 +228,11 @@ public class ForcePackVelocity implements ForcePackPlatform {
         for (String name : root.getKeys()) {
             log("Checking %s - %s", typeName, name);
             final VelocityConfig serverConfig = root.getConfig(name);
+            if (serverConfig.getString("selection-provider") != null) {
+                log("Skipping static resource pack config for %s - %s, it is managed by a selection provider", typeName, name);
+                continue;
+            }
+
             final Map<String, VelocityConfig> configs = new HashMap<>();
             // Add the default fallback
             configs.put("default", serverConfig.getConfig("resourcepack"));
