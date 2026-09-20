@@ -7,6 +7,7 @@ import com.convallyria.forcepack.api.utils.ClientVersion;
 import com.convallyria.forcepack.api.utils.GeyserUtil;
 import com.convallyria.forcepack.velocity.ForcePackVelocity;
 import com.convallyria.forcepack.velocity.config.VelocityConfig;
+import com.convallyria.forcepack.velocity.managed.VelocityManagedService;
 import com.convallyria.forcepack.velocity.player.ForcePackVelocityPlayer;
 import com.velocitypowered.api.event.EventTask;
 import com.velocitypowered.api.event.connection.DisconnectEvent;
@@ -25,7 +26,6 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -58,6 +58,12 @@ public final class PackHandler {
     }
 
     public EventTask handleConfigurationPhase(final Player player, final ServerConnection server) {
+        synchronized (player) {
+            return handleConfigurationPhaseLocked(player, server);
+        }
+    }
+
+    private EventTask handleConfigurationPhaseLocked(final Player player, final ServerConnection server) {
         final UUID uuid = player.getUniqueId();
         configurationPhaseHandled.add(uuid);
 
@@ -82,6 +88,7 @@ public final class PackHandler {
     }
 
     public boolean takeConfigurationPhaseHandled(final Player player) {
+        configurationPhaseServers.remove(player.getUniqueId());
         return configurationPhaseHandled.remove(player.getUniqueId());
     }
 
@@ -90,7 +97,7 @@ public final class PackHandler {
     }
 
     private void completeConfigurationPhase(final UUID uuid) {
-        configurationPhaseServers.remove(uuid);
+        // Keep the target valid until post-connect: completion callbacks can still finish here.
         final CompletableFuture<Void> future = configurationPhaseCompletions.remove(uuid);
         if (future != null) {
             future.complete(null);
@@ -138,6 +145,8 @@ public final class PackHandler {
     }
 
     private void onDisconnect(DisconnectEvent event) {
+        plugin.getManagedService().ifPresent(service -> ((VelocityManagedService) service)
+                .onDisconnect(event.getPlayer().getUniqueId()));
         removeFromWaiting(event.getPlayer(), false);
         pendingTasks.remove(event.getPlayer().getUniqueId());
         configurationPhaseHandled.remove(event.getPlayer().getUniqueId());
@@ -161,6 +170,12 @@ public final class PackHandler {
     }
 
     public void setPack(final Player player, final ServerConnection server) {
+        synchronized (player) {
+            setPackLocked(player, server);
+        }
+    }
+
+    private void setPackLocked(final Player player, final ServerConnection server) {
         // The player connected to a new server
         // Therefore, any pending resource pack sends from the last server should be cancelled
         final Set<PendingResourcePackSend> pending = pendingTasks.remove(player.getUniqueId());
@@ -179,6 +194,11 @@ public final class PackHandler {
             // Player is exempt from resource packs
             return;
         }
+
+        // A profile bound to a selection provider owns everything about its offer: what is sent,
+        // under which id, with which policy. The static path below must not also run for it.
+        final VelocityManagedService managed = (VelocityManagedService) plugin.getManagedService().orElse(null);
+        if (managed != null && managed.handleManagedServer(player, server)) return;
 
         // Find whether the config contains this server
         final ServerInfo serverInfo = server.getServerInfo();
@@ -224,6 +244,15 @@ public final class PackHandler {
                 return true;
             }).forEach(toApply -> this.runSetPackTask(player, toApply, protocol));
         }, () -> {
+            final VelocityConfig unloadConfig = plugin.getConfig().getConfig("unload-pack");
+            // The exclusion list has to be honoured before anything is taken away, on every client
+            // version. Modern clients used to be cleared first and asked afterwards.
+            if (unloadConfig != null && unloadConfig.getStringList("exclude").contains(serverInfo.getName())) {
+                plugin.log("Not unloading resource packs for %s: server %s is excluded.",
+                        player.getUsername(), serverInfo.getName());
+                return;
+            }
+
             // 1.20.3+ allows us to simply clear all their applied resource packs!
             if (protocol >= ProtocolVersion.MINECRAFT_1_20_3.getProtocol()) {
                 player.clearResourcePacks();
@@ -238,15 +267,11 @@ public final class PackHandler {
                 return;
             }
 
-            final VelocityConfig unloadPack = plugin.getConfig().getConfig("unload-pack");
-            final boolean enableUnload = unloadPack.getBoolean("enable");
+            final boolean enableUnload = unloadConfig != null && unloadConfig.getBoolean("enable");
             if (!enableUnload) {
                 plugin.log("Unload pack is disabled, not sending for server %s, user %s.", serverInfo.getName(), player.getUsername());
                 return;
             }
-
-            final List<String> excluded = unloadPack.getStringList("exclude");
-            if (excluded.contains(serverInfo.getName())) return;
 
             plugin.getPacksByServerAndVersion(ForcePackVelocity.EMPTY_SERVER_NAME, player.getProtocolVersion()).ifPresent(packs -> {
                 // This can only return 1 pack since at this point the player is <= 1.20.2
@@ -261,7 +286,15 @@ public final class PackHandler {
         });
     }
 
-    private void runSetPackTask(Player player, ResourcePack resourcePack, int protocol) {
+    /**
+     * Sends a pack through the single tracked path: waiting state first, then a delayed send that
+     * a server switch can cancel.
+     *
+     * @param player the player
+     * @param resourcePack the pack to send
+     * @param protocol the player's protocol version
+     */
+    public void runSetPackTask(Player player, ResourcePack resourcePack, int protocol) {
         // There is a bug in velocity when connecting to another server, where the prompt screen
         // will be forcefully closed by the server if we don't delay it for a second.
         final boolean update = plugin.getConfig().getBoolean("update-gui", true);
@@ -276,8 +309,12 @@ public final class PackHandler {
             }
 
             plugin.log("Applying resource pack " + resourcePack.getUUID().toString() + " to " + player.getUsername() + ".");
-            final Set<PendingResourcePackSend> pendingSends = pendingTasks.get(player.getUniqueId());
-            pendingSends.remove(pendingSend.get());
+            // Removed through the map so a concurrent switch cannot mutate the set underneath us,
+            // and so a switch that already dropped the entry does not throw.
+            pendingTasks.computeIfPresent(player.getUniqueId(), (uuid, pendingSends) -> {
+                pendingSends.remove(pendingSend.get());
+                return pendingSends;
+            });
             resourcePack.setResourcePack(player.getUniqueId());
         }).delay(1L, TimeUnit.SECONDS);
 

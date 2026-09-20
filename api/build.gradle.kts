@@ -3,6 +3,10 @@ plugins {
     `maven-publish`
 }
 
+// Consumers depend on the api with compileOnly rather than shading a second copy of these
+// classes, so the publication needs real coordinates.
+group = "com.convallyria.forcepack"
+
 repositories {
     maven("https://repo.opencollab.dev/main/")
 }
@@ -32,13 +36,23 @@ publishing {
     }
 
     repositories {
+        // Upstream's repository. Restore this once the managed-selection work is
+        // merged upstream; until then this fork publishes to Empire War's own.
         // See Gradle docs for how to provide credentials to PasswordCredentials
         // https://docs.gradle.org/current/samples/sample_publishing_credentials.html
+//        maven {
+//            val isSnapshot = true//ver.contains("SNAPSHOT")
+//            name = if (isSnapshot) "snapshots" else "releases"
+//            url = uri("https://repo.convallyria.com/$name/")
+//            credentials {
+//                username = System.getenv("MAVEN_USERNAME")
+//                password = System.getenv("MAVEN_PASSWORD")
+//            }
+//        }
 
         maven {
-            val isSnapshot = true//ver.contains("SNAPSHOT")
-            name = if (isSnapshot) "snapshots" else "releases"
-            url = uri("https://repo.convallyria.com/$name/")
+            name = "empirewar"
+            url = uri("https://repo.empirewar.org/empirewar/")
             credentials {
                 username = System.getenv("MAVEN_USERNAME")
                 password = System.getenv("MAVEN_PASSWORD")

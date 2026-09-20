@@ -3,10 +3,12 @@ on:
   push:
     branches:
       - master
+      - feat/resource-pack-delivery
 
 jobs:
   build:
-    if: github.repository_owner == 'SamB440'
+#    if: github.repository_owner == 'SamB440'
+    if: github.repository_owner == 'EmpireWar'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -23,7 +25,7 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6 # Handles Gradle wrapper validation and basic caching
 
-      - name: Build and Publish to Convallyria repository
+      - name: Build and Publish to Empire War repository
         run: ./gradlew build publish
         env:
           MAVEN_USERNAME: ${{ secrets.REPO_USERNAME }}
