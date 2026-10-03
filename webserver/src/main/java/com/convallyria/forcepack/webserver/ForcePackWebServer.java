@@ -1,7 +1,5 @@
 package com.convallyria.forcepack.webserver;
 
-import com.google.common.cache.Cache;
-import com.google.common.cache.CacheBuilder;
 import com.google.common.hash.Hashing;
 import com.google.common.io.Files;
 import io.javalin.Javalin;
@@ -14,10 +12,9 @@ import java.io.InputStream;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.util.HashMap;
 import java.util.Map;
 import java.util.Scanner;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class ForcePackWebServer {
 
@@ -27,13 +24,19 @@ public class ForcePackWebServer {
     private final String protocol;
     private final String ipAddress;
     private final int port;
-    private final Map<File, String> hostedPacks = new HashMap<>();
+    // Static configuration packs. Cleared and rebuilt on every reload, and read from request
+    // threads while that happens.
+    private final Map<File, String> hostedPacks = new ConcurrentHashMap<>();
+    // Managed packs. Content-indexed and immutable, so a reload cannot invalidate a URL that
+    // a prepared selection or an in-flight download is still using.
+    private final ManagedPackRegistry managedPacks;
 
     public ForcePackWebServer(Path dataFolder, String protocol, String serverIp, int port, boolean usePort) throws IOException {
         JavalinLogger.enabled = false;
         JavalinLogger.startupInfo = false;
         this.app = Javalin.create(config -> config.showJavalinBanner = false).start(port);
         this.dataFolder = dataFolder;
+        this.managedPacks = new ManagedPackRegistry(dataFolder.resolve("managed"));
         setupEndpoints();
         this.usePort = usePort;
         this.protocol = protocol;
@@ -53,25 +56,42 @@ public class ForcePackWebServer {
         this.hostedPacks.clear();
     }
 
+    /**
+     * The content-indexed registry used for managed packs.
+     *
+     * <p>Deliberately not cleared by {@link #clearHostedPacks()}: a managed URL stays valid
+     * across reloads until its content is explicitly collected.</p>
+     *
+     * @return the managed registry
+     */
+    public ManagedPackRegistry getManagedPacks() {
+        return managedPacks;
+    }
+
+    /**
+     * Hosts an immutable local file and returns the URL a client can download it from.
+     *
+     * @param file the file to host
+     * @param sha1 the expected SHA-1 of that file
+     * @param sizeBytes the expected size in bytes
+     * @return the client-downloadable URL
+     * @throws IOException if the bytes cannot be read or do not match
+     */
+    public String hostManagedPack(Path file, String sha1, long sizeBytes) throws IOException {
+        return getUrl() + managedPacks.register(file, sha1, sizeBytes).servePath();
+    }
+
     public void shutdown() {
         app.stop();
     }
 
     public String getUrl() {
-        return protocol + ipAddress + (usePort? ":" + port : "");
+        return protocol + ipAddress + (usePort ? ":" + port : "");
     }
 
     public String getHostedEndpoint(String urlString) {
         final File targetFile = new File(dataFolder + File.separator + urlString.replace("forcepack://", ""));
         return getUrl() + "/serve/" + hostedPacks.get(targetFile) + ".zip";
-    }
-
-    private final Cache<String, Runnable> waitingServes = CacheBuilder.newBuilder()
-            .expireAfterWrite(2, TimeUnit.MINUTES)
-            .build();
-
-    public void awaitServe(String id, Runnable runnable) {
-        waitingServes.put(id, runnable);
     }
 
     private void setupEndpoints() {
@@ -86,28 +106,38 @@ public class ForcePackWebServer {
             // X-Minecraft-UUID=4b319cd4e8274dcfa3039a3fce310755, Host=localhost:2222}
 
             // If this is the real resource pack
-            for (File hostedPack : hostedPacks.keySet()) {
-                if (id.equals(hostedPacks.get(hostedPack) + ".zip")) {
-                    final byte[] fileBytes = Files.asByteSource(hostedPack).read();
-                    ctx.result(fileBytes)
-                            .header("X-Hosted-By", "forcepack")
-                            .header("Content-Type", "application/zip")
-                            .header("Content-Disposition", "attachment; filename=" + hostedPack.getName());
+            for (Map.Entry<File, String> hostedPack : hostedPacks.entrySet()) {
+                if (id.equals(hostedPack.getValue() + ".zip")) {
+                    serve(ctx, hostedPack.getKey().toPath(), hostedPack.getKey().getName());
                     return;
                 }
             }
 
-            ctx.status(HttpStatus.OK)
-                    .header("X-Hosted-By", "forcepack")
-                    .header("Content-Type", "application/zip")
-                    .header("Content-Disposition", "attachment; filename=" + id);
-
-            final Runnable runnable = waitingServes.getIfPresent(id);
-            waitingServes.invalidate(id);
-            if (runnable != null) {
-                runnable.run();
-            }
+            // Nothing is hosted under that identity. Saying so beats handing the client an
+            // empty body it will report as a corrupt pack.
+            ctx.status(HttpStatus.NOT_FOUND).result("");
         });
+
+        app.get(ManagedPackRegistry.PATH_PREFIX + "<id>", ctx -> {
+            final String id = ctx.pathParam("id");
+            final ManagedPackRegistry.Entry entry = managedPacks.lookup(id).orElse(null);
+            if (entry == null) {
+                ctx.status(HttpStatus.NOT_FOUND).result("");
+                return;
+            }
+            serve(ctx, entry.file(), entry.sha1() + ".zip");
+        });
+    }
+
+    private static void serve(io.javalin.http.Context ctx, Path file, String fileName) throws IOException {
+        // Streamed rather than read into a byte[]: a pack is megabytes and every concurrent
+        // download would otherwise hold its own copy in heap.
+        final InputStream stream = java.nio.file.Files.newInputStream(file);
+        ctx.result(stream)
+                .header("X-Hosted-By", "forcepack")
+                .header("Content-Type", "application/zip")
+                .header("Content-Length", String.valueOf(java.nio.file.Files.size(file)))
+                .header("Content-Disposition", "attachment; filename=" + fileName);
     }
 
     public static String getIp() {

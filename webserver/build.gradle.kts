@@ -26,4 +26,10 @@ tasks {
     jar {
         dependsOn(generateRuntimeDownloadResourceForRuntimeDownloadOnly, generateRuntimeDownloadResourceForRuntimeDownload)
     }
+
+    // The runtime download configurations are on the test compile classpath, so their generated
+    // resources have to exist before tests compile.
+    compileTestJava {
+        dependsOn(generateRuntimeDownloadResourceForRuntimeDownloadOnly, generateRuntimeDownloadResourceForRuntimeDownload)
+    }
 }

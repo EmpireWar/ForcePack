@@ -1,6 +1,7 @@
 package com.convallyria.forcepack.velocity.listener;
 
 import com.convallyria.forcepack.api.check.SpoofCheck;
+import com.convallyria.forcepack.api.managed.ManagedPackStatus;
 import com.convallyria.forcepack.api.permission.Permissions;
 import com.convallyria.forcepack.api.player.ForcePackPlayer;
 import com.convallyria.forcepack.api.resourcepack.ResourcePack;
@@ -8,6 +9,8 @@ import com.convallyria.forcepack.api.utils.GeyserUtil;
 import com.convallyria.forcepack.velocity.ForcePackVelocity;
 import com.convallyria.forcepack.velocity.config.VelocityConfig;
 import com.convallyria.forcepack.velocity.handler.PackHandler;
+import com.convallyria.forcepack.velocity.managed.PackStateTracker;
+import com.convallyria.forcepack.velocity.managed.VelocityManagedService;
 import com.convallyria.forcepack.velocity.resourcepack.VelocityResourcePack;
 import com.velocitypowered.api.command.CommandSource;
 import com.velocitypowered.api.event.EventTask;
@@ -16,6 +19,7 @@ import com.velocitypowered.api.event.Subscribe;
 import com.velocitypowered.api.event.connection.DisconnectEvent;
 import com.velocitypowered.api.event.player.PlayerResourcePackStatusEvent;
 import com.velocitypowered.api.event.player.ServerPostConnectEvent;
+import com.velocitypowered.api.event.player.ServerPreConnectEvent;
 import com.velocitypowered.api.event.player.configuration.PlayerConfigurationEvent;
 import com.velocitypowered.api.network.ProtocolVersion;
 import com.velocitypowered.api.proxy.Player;
@@ -39,96 +43,154 @@ public class ResourcePackListener {
     @Subscribe(order = PostOrder.EARLY)
     public void onPackStatus(PlayerResourcePackStatusEvent event) {
         final Player player = event.getPlayer();
-        final ServerConnection currentServer = player.getCurrentServer()
-                .or(() -> plugin.getPackHandler().getConfigurationPhaseServer(player))
-                .orElse(null);
-        if (currentServer == null) {
-            plugin.log(player.getUsername() + "'s server does not exist.");
-            return;
-        }
+        synchronized (player) {
+            final ServerConnection currentServer = plugin.getPackHandler().getConfigurationPhaseServer(player)
+                    .or(player::getCurrentServer)
+                    .orElse(null);
+            if (currentServer == null) {
+                plugin.log(player.getUsername() + "'s server does not exist.");
+                return;
+            }
 
-        final PlayerResourcePackStatusEvent.Status status = event.getStatus();
+            final PlayerResourcePackStatusEvent.Status status = event.getStatus();
 
-        // Check if the server they're on has a resource pack
-        final String serverName = currentServer.getServerInfo().getName();
-        final ResourcePackInfo packInfo = event.getPackInfo(); // Returns null on < 1.20.3 clients, and if a UUID isn't provided I guess?
-        final UUID id = packInfo == null ? null : packInfo.getId();
-        if (id != null) plugin.log(player.getUsername() + " sent response id '%s'", id.toString());
+            // Check if the server they're on has a resource pack
+            final String serverName = currentServer.getServerInfo().getName();
+            final ResourcePackInfo packInfo = event.getPackInfo(); // Returns null on < 1.20.3 clients, and if a UUID isn't provided I guess?
+            final UUID id = packInfo == null ? null : packInfo.getId();
+            if (id != null) plugin.log(player.getUsername() + " sent response id '%s'", id.toString());
 
-        if ((packInfo != null && packInfo.getOrigin() != ResourcePackInfo.Origin.PLUGIN_ON_PROXY) || !plugin.getPackHandler().isWaitingFor(player, id)) {
-            plugin.log("Resource pack with URL %s and ID %s was sent from a downstream server! This is unsupported behaviour.", packInfo == null ? "(unknown: legacy)" : packInfo.getUrl(), id);
-            return;
-        }
+            if ((packInfo != null && packInfo.getOrigin() != ResourcePackInfo.Origin.PLUGIN_ON_PROXY) || !plugin.getPackHandler().isWaitingFor(player, id)) {
+                plugin.log("Resource pack with URL %s and ID %s was sent from a downstream server! This is unsupported behaviour.", packInfo == null ? "(unknown: legacy)" : packInfo.getUrl(), id);
+                return;
+            }
 
-        // If on 1.20.3+, use UUID to find the resource pack
-        // Otherwise, it's a singular resource pack, just filter to what is the first (and can only be) the first element.
-        final Set<ResourcePack> packsByServer = plugin.getPacksByServerAndVersion(serverName, player.getProtocolVersion()).orElse(null);
-        ResourcePack packByServer = packsByServer == null ? null : packsByServer.stream()
-                .filter(pack -> player.getProtocolVersion().getProtocol() < ProtocolVersion.MINECRAFT_1_20_3.getProtocol() || pack.getUUID().equals(id))
-                .findFirst().orElse(null);
-        if (packByServer == null) {
-            plugin.log("%s does not have a resource pack matching %s, ignoring status %s.", serverName, id == null ? "null" : id.toString(), status.toString());
-            return;
-        }
+            // A managed offer carries its own descriptor and policy. Read the tracked request instead
+            // of searching this server's configured packs for something that looks similar: during a
+            // switch the configured packs are no longer the ones this reply is about.
+            final VelocityManagedService managed = (VelocityManagedService) plugin.getManagedService().orElse(null);
+            final PackStateTracker.Request request = managed == null
+                    ? null
+                    : managed.getTracker().request(player.getUniqueId(), id).orElse(null);
+            if (request != null) {
+                if (managed.acceptsStatus(player, request.generation())) {
+                    handleManagedStatus(player, currentServer, managed, request, status);
+                }
+                return;
+            }
 
-        boolean geyser = plugin.getConfig().getBoolean("geyser") && GeyserUtil.isBedrockPlayer(player.getUniqueId());
-        boolean canBypass = player.hasPermission(Permissions.BYPASS) && plugin.getConfig().getBoolean("bypass-permission");
-        if (canBypass || geyser) {
-            plugin.log("Ignoring player " + player.getUsername() + " as they do not have permissions or are a geyser player.");
-            return;
-        }
+            // If on 1.20.3+, use UUID to find the resource pack
+            // Otherwise, it's a singular resource pack, just filter to what is the first (and can only be) the first element.
+            final Set<ResourcePack> packsByServer = plugin.getPacksByServerAndVersion(serverName, player.getProtocolVersion()).orElse(null);
+            ResourcePack packByServer = packsByServer == null ? null : packsByServer.stream()
+                    .filter(pack -> player.getProtocolVersion().getProtocol() < ProtocolVersion.MINECRAFT_1_20_3.getProtocol() || pack.getUUID().equals(id))
+                    .findFirst().orElse(null);
+            if (packByServer == null) {
+                plugin.log("%s does not have a resource pack matching %s, ignoring status %s.", serverName, id == null ? "null" : id.toString(), status.toString());
+                return;
+            }
 
-        final VelocityConfig root;
-        if (packByServer.getServer().contains(ForcePackVelocity.GLOBAL_SERVER_NAME)) {
-            root = plugin.getConfig().getConfig("global-pack");
-        } else {
-            if (packByServer instanceof VelocityResourcePack) {
-                VelocityResourcePack vrp = (VelocityResourcePack) packByServer;
-                if (vrp.getGroup() != null) {
-                    root = plugin.getConfig().getConfig("groups").getConfig(vrp.getGroup());
+            boolean geyser = plugin.getConfig().getBoolean("geyser") && GeyserUtil.isBedrockPlayer(player.getUniqueId());
+            boolean canBypass = player.hasPermission(Permissions.BYPASS) && plugin.getConfig().getBoolean("bypass-permission");
+            if (canBypass || geyser) {
+                plugin.log("Ignoring player " + player.getUsername() + " as they do not have permissions or are a geyser player.");
+                return;
+            }
+
+            final VelocityConfig root;
+            if (packByServer.getServer().contains(ForcePackVelocity.GLOBAL_SERVER_NAME)) {
+                root = plugin.getConfig().getConfig("global-pack");
+            } else {
+                if (packByServer instanceof VelocityResourcePack) {
+                    VelocityResourcePack vrp = (VelocityResourcePack) packByServer;
+                    if (vrp.getGroup() != null) {
+                        root = plugin.getConfig().getConfig("groups").getConfig(vrp.getGroup());
+                    } else {
+                        root = plugin.getConfig().getConfig("servers").getConfig(serverName);
+                    }
                 } else {
                     root = plugin.getConfig().getConfig("servers").getConfig(serverName);
                 }
+            }
+
+            plugin.log(player.getUsername() + " sent status: " + event.getStatus());
+
+            if (tryValidateHacks(player, status, root)) return;
+
+            final VelocityConfig actions = root.getConfig("actions").getConfig(status.name());
+            if (actions != null) {
+                for (String cmd : actions.getStringList("commands")) {
+                    final CommandSource console = plugin.getServer().getConsoleCommandSource();
+                    plugin.getServer().getCommandManager().executeAsync(console, cmd.replace("[player]", player.getUsername()));
+                }
+            }
+
+            final boolean kick = actions != null && actions.getBoolean("kick");
+
+            // Declined/failed is valid and should be allowed, server owner decides whether they get kicked
+            if (status != PlayerResourcePackStatusEvent.Status.ACCEPTED && status != PlayerResourcePackStatusEvent.Status.DOWNLOADED && !kick) {
+                plugin.log("Sent player '%s' plugin message downstream to '%s' for status '%s'", player.getUsername(), currentServer.getServerInfo().getName(), status.name());
+                // No longer applying, remove them from the list
+                plugin.getPackHandler().processWaitingResourcePack(player, packByServer.getUUID());
+                final String name = status == PlayerResourcePackStatusEvent.Status.SUCCESSFUL ? "SUCCESSFULLY_LOADED" : status.name();
+                final boolean waiting = plugin.getPackHandler().isWaiting(player);
+                currentServer.sendPluginMessage(PackHandler.FORCEPACK_STATUS_IDENTIFIER, (packByServer.getUUID().toString() + ";" + name + ";" + !waiting).getBytes(StandardCharsets.UTF_8));
+                plugin.getPackHandler().getForcePackPlayer(player).ifPresentOrElse(forcePackPlayer -> {
+                    plugin.log("Current packs we are waiting for: %s", forcePackPlayer.getWaitingPacks());
+                }, () -> plugin.log("Waiting for? %s", waiting));
+            }
+
+            final String text = actions == null ? null : actions.getString("message");
+            if (text == null) return;
+
+            final Component component = plugin.getMiniMessage().deserialize(text);
+            if (kick) {
+                player.disconnect(component);
             } else {
-                root = plugin.getConfig().getConfig("servers").getConfig(serverName);
+                player.sendMessage(component);
             }
         }
+    }
 
-        plugin.log(player.getUsername() + " sent status: " + event.getStatus());
+    private void handleManagedStatus(Player player,
+                                     ServerConnection currentServer,
+                                     VelocityManagedService managed,
+                                     PackStateTracker.Request request,
+                                     PlayerResourcePackStatusEvent.Status status) {
+        final ManagedPackStatus managedStatus = toManagedStatus(status);
+        plugin.log("%s sent managed status %s for slot %s", player.getUsername(),
+                managedStatus.name(), request.entry().logicalKey());
 
-        if (tryValidateHacks(player, status, root)) return;
+        final VelocityConfig profileConfig = managed
+                .profileConfigFor(currentServer.getServerInfo().getName()).orElse(null);
+        if (profileConfig != null && tryValidateHacks(player, status, profileConfig)) return;
 
-        final VelocityConfig actions = root.getConfig("actions").getConfig(status.name());
-        if (actions != null) {
-            for (String cmd : actions.getStringList("commands")) {
-                final CommandSource console = plugin.getServer().getConsoleCommandSource();
-                plugin.getServer().getCommandManager().executeAsync(console, cmd.replace("[player]", player.getUsername()));
-            }
+        if (!managed.getTracker().onStatus(player.getUniqueId(), request.entry().packId(), managedStatus)) return;
+
+        // Progress, not an outcome.
+        if (managedStatus == ManagedPackStatus.ACCEPTED || managedStatus == ManagedPackStatus.DOWNLOADED) return;
+
+        // Enforcement belongs to the request's own failure policy, applied when the operation
+        // completes. Only the backend notification happens here.
+        plugin.getPackHandler().processWaitingResourcePack(player, request.entry().packId());
+        final boolean waiting = plugin.getPackHandler().isWaiting(player);
+        final String name = status == PlayerResourcePackStatusEvent.Status.SUCCESSFUL
+                ? "SUCCESSFULLY_LOADED"
+                : status.name();
+        currentServer.sendPluginMessage(PackHandler.FORCEPACK_STATUS_IDENTIFIER,
+                (request.entry().packId() + ";" + name + ";" + !waiting).getBytes(StandardCharsets.UTF_8));
+        plugin.log("Sent player '%s' plugin message downstream to '%s' for status '%s'", player.getUsername(),
+                currentServer.getServerInfo().getName(), name);
+    }
+
+    private static ManagedPackStatus toManagedStatus(PlayerResourcePackStatusEvent.Status status) {
+        if (status == PlayerResourcePackStatusEvent.Status.SUCCESSFUL) {
+            return ManagedPackStatus.SUCCESSFULLY_LOADED;
         }
-
-        final boolean kick = actions != null && actions.getBoolean("kick");
-
-        // Declined/failed is valid and should be allowed, server owner decides whether they get kicked
-        if (status != PlayerResourcePackStatusEvent.Status.ACCEPTED && status != PlayerResourcePackStatusEvent.Status.DOWNLOADED && !kick) {
-            plugin.log("Sent player '%s' plugin message downstream to '%s' for status '%s'", player.getUsername(), currentServer.getServerInfo().getName(), status.name());
-            // No longer applying, remove them from the list
-            plugin.getPackHandler().processWaitingResourcePack(player, packByServer.getUUID());
-            final String name = status == PlayerResourcePackStatusEvent.Status.SUCCESSFUL ? "SUCCESSFULLY_LOADED" : status.name();
-            final boolean waiting = plugin.getPackHandler().isWaiting(player);
-            currentServer.sendPluginMessage(PackHandler.FORCEPACK_STATUS_IDENTIFIER, (packByServer.getUUID().toString() + ";" + name + ";" + !waiting).getBytes(StandardCharsets.UTF_8));
-            plugin.getPackHandler().getForcePackPlayer(player).ifPresentOrElse(forcePackPlayer -> {
-                plugin.log("Current packs we are waiting for: %s", forcePackPlayer.getWaitingPacks());
-            }, () -> plugin.log("Waiting for? %s", waiting));
-        }
-
-        final String text = actions == null ? null : actions.getString("message");
-        if (text == null) return;
-
-        final Component component = plugin.getMiniMessage().deserialize(text);
-        if (kick) {
-            player.disconnect(component);
-        } else {
-            player.sendMessage(component);
+        try {
+            return ManagedPackStatus.valueOf(status.name());
+        } catch (IllegalArgumentException unknown) {
+            return ManagedPackStatus.UNKNOWN;
         }
     }
 
@@ -194,6 +256,13 @@ public class ResourcePackListener {
         }
 
         plugin.getPackHandler().setPack(player, currentServer.get());
+    }
+
+    @Subscribe(order = PostOrder.LAST)
+    public void onBackendAttempt(ServerPreConnectEvent event) {
+        if (!event.getResult().isAllowed()) return;
+        plugin.getManagedService().ifPresent(service -> ((VelocityManagedService) service)
+                .onBackendTransition(event.getPlayer()));
     }
 
     @Subscribe(order = PostOrder.LATE)

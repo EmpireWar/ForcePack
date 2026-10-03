@@ -77,6 +77,20 @@ debug = false
     # port-on-url defines whether to use the port in the URL (set to false when this service is behind a web proxy)
     port-on-url = true
 
+# Managed selection. None of this applies to a profile without a selection-provider.
+# A managed profile's packs are chosen at runtime by another plugin through the ForcePack API
+# instead of by the urls and hashes in this file.
+[managed]
+    # How long a client has to apply a managed pack, in seconds.
+    # Giving up releases any configuration phase hold and applies the profile's failure policy.
+    client-timeout-seconds = 120
+    # How long preparing one pack may take, in seconds.
+    # Preparing verifies the bytes and, for a local file, hosts it. It never touches a client.
+    prepare-timeout-seconds = 600
+    # How long a managed pack stays hosted after nothing points at it any more, in minutes.
+    # A pack that is applied, waiting, or kept as a rollback candidate is never collected.
+    hosted-retention-minutes = 1440
+
 [unload-pack]
     # Whether to send an empty resource pack when joining a server without one configured, and the player has one applied
     enable = true
@@ -188,6 +202,19 @@ debug = false
         resourcepack.hashes = ["118AFFFC54CDCD308702F81BA24E03223F15FE5F"]
         # The prompt message for clients on 1.17+.
         resourcepack.prompt = "<yellow>Please accept our resource pack to improve your experience."
+        # Optional. Hands this profile's selection to a plugin that registered under this name
+        # through the ForcePack API. The urls and hashes above are then not offered here.
+        # If that plugin has not registered, this profile is unavailable: nothing is offered and an
+        # error is logged, rather than admitting the player with a pack that is not the right one.
+        # Works the same way on a group.
+        #selection-provider = "ExampleSelectionPlugin"
+        # Whether a managed offer must be accepted. Setting this to false keeps a failed offer
+        # recoverable, which is what a test offer needs. Applies only to managed profiles.
+        #managed-required = true
+        # What to do when a managed offer fails: KICK, NOTIFY, or RESTORE_PREVIOUS.
+        # RESTORE_PREVIOUS reapplies the last selection this player loaded successfully, and reports
+        # recovery only once the client acknowledges it. Applies only to managed profiles.
+        #managed-failure-policy = "KICK"
         [servers.example-server.actions]
             # List of valid actions: https://jd.advntr.dev/api/4.15.0/net/kyori/adventure/resource/ResourcePackStatus.html
             [servers.example-server.actions.ACCEPTED]
